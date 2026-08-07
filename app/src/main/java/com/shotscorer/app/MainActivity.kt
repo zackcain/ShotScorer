@@ -8,8 +8,6 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.herohan.uvcapp.CameraHelper
 import com.herohan.uvcapp.ICameraHelper
-import com.serenegiant.usb.Size
-import com.serenegiant.usb.UVCParam
 import com.shotscorer.app.databinding.ActivityMainBinding
 
 class MainActivity : AppCompatActivity() {
@@ -68,15 +66,12 @@ class MainActivity : AppCompatActivity() {
 
         override fun onDeviceOpen(device: UsbDevice, isFirstOpen: Boolean) {
             Log.d(TAG, "onDeviceOpen ${device.deviceName} first=$isFirstOpen")
-            cameraHelper?.openCamera(
-                UVCParam(DEFAULT_WIDTH, DEFAULT_HEIGHT, null),
-                null
-            )
+            cameraHelper?.openCamera()
         }
 
         override fun onCameraOpen(device: UsbDevice) {
             Log.d(TAG, "onCameraOpen ${device.deviceName}")
-            val size: Size? = cameraHelper?.previewSize
+            val size = cameraHelper?.previewSize
             val w = size?.width ?: DEFAULT_WIDTH
             val h = size?.height ?: DEFAULT_HEIGHT
             runOnUiThread { binding.preview.setAspectRatio(w, h) }
