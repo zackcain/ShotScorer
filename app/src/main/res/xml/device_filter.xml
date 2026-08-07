@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- USB Video Class (UVC) base class -->
+    <usb-device class="239" subclass="2" />
+    <!-- Some cameras enumerate as class 14 (Video) -->
+    <usb-device class="14" subclass="1" />
+    <usb-device class="14" subclass="3" />
+</resources>
