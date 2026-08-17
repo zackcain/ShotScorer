@@ -15,10 +15,12 @@ class OverlayView @JvmOverloads constructor(
 ) : View(context, attrs, defStyle) {
 
     data class Bull(val cx: Float, val cy: Float, val r: Float)
+    data class CardRect(val x: Float, val y: Float, val w: Float, val h: Float)
 
     private data class State(
         val bulls: List<Bull>,
         val activeIndex: Int,
+        val card: CardRect?,
         val frameW: Int,
         val frameH: Int,
         val timestampMs: Long,
@@ -45,9 +47,15 @@ class OverlayView @JvmOverloads constructor(
         strokeWidth = 2f
         isAntiAlias = true
     }
+    private val cardPaint = Paint().apply {
+        color = Color.argb(140, 80, 180, 255) // translucent blue for card outline
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        isAntiAlias = true
+    }
 
-    fun updateBulls(bulls: List<Bull>, activeIndex: Int, frameW: Int, frameH: Int) {
-        state = State(bulls, activeIndex, frameW, frameH, System.currentTimeMillis())
+    fun updateFrame(bulls: List<Bull>, activeIndex: Int, card: CardRect?, frameW: Int, frameH: Int) {
+        state = State(bulls, activeIndex, card, frameW, frameH, System.currentTimeMillis())
         postInvalidate()
     }
 
@@ -81,6 +89,16 @@ class OverlayView @JvmOverloads constructor(
         val sx = renderW / s.frameW
         val sy = renderH / s.frameH
         val scale = min(sx, sy)
+
+        s.card?.let { c ->
+            canvas.drawRect(
+                offX + c.x * sx,
+                offY + c.y * sy,
+                offX + (c.x + c.w) * sx,
+                offY + (c.y + c.h) * sy,
+                cardPaint,
+            )
+        }
 
         for ((i, b) in s.bulls.withIndex()) {
             val cx = offX + b.cx * sx

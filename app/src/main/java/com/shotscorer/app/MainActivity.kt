@@ -24,6 +24,7 @@ import org.opencv.android.OpenCVLoader
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
+import org.opencv.core.MatOfPoint
 import org.opencv.core.Rect as CvRect
 import org.opencv.core.Size as CvSize
 import org.opencv.imgproc.Imgproc
@@ -416,21 +417,20 @@ class MainActivity : AppCompatActivity() {
 
         detectionExecutor.execute {
             try {
-                val bulls = detectBulls(yBytes, w, h)
+                val result = detectFrame(yBytes, w, h)
                 runOnUiThread {
-                    if (bulls.isEmpty()) {
+                    if (result.bulls.isEmpty() && result.card == null) {
                         binding.overlay.clearBull()
                     } else {
-                        // Active bull = closest to frame center (that's where the rifle is aimed)
                         val cxFrame = w / 2f
                         val cyFrame = h / 2f
-                        val activeIdx = bulls.indices.minByOrNull { i ->
-                            val b = bulls[i]
+                        val activeIdx = result.bulls.indices.minByOrNull { i ->
+                            val b = result.bulls[i]
                             val dx = b.cx - cxFrame
                             val dy = b.cy - cyFrame
                             dx * dx + dy * dy
-                        } ?: 0
-                        binding.overlay.updateBulls(bulls, activeIdx, w, h)
+                        } ?: -1
+                        binding.overlay.updateFrame(result.bulls, activeIdx, result.card, w, h)
                     }
                 }
             } catch (t: Throwable) {
@@ -441,20 +441,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private data class DetectResult(val bulls: List<OverlayView.Bull>, val card: OverlayView.CardRect?)
+
     /**
-     * Find all bulls in the frame. Returns list in image (full-resolution) coordinates,
-     * ordered best-first by contrast score.
+     * Two-stage pipeline:
+     *   1. Find the card — largest bright rectangular region in the frame.
+     *   2. Run HoughCircles restricted to that region, then filter by dark-disk contrast.
      *
-     * Pipeline:
-     *  1. Downscale to ~960 wide for HoughCircles speed.
-     *  2. CLAHE + median blur to normalise lighting.
-     *  3. HoughCircles with permissive thresholds — cast a wide net.
-     *  4. For each candidate, compute a "bull-ness" score: (outer_bright - inner_dark).
-     *     Real bulls are dark disks on light backgrounds → high positive score.
-     *     Scene clutter (drills, box edges) → near-zero or negative.
-     *  5. Keep only candidates with score above a threshold.
+     * Rationale: at rifle-range setups the target CARD is the dominant bright
+     * object in view. Non-card regions (garage wall, tire, shelving) produce
+     * plenty of dark-on-light gradients that fool a whole-frame Hough sweep.
+     * Constraining to the card eliminates those and lets us tighten per-bull
+     * thresholds because we know we're on target paper.
      */
-    private fun detectBulls(y: ByteArray, w: Int, h: Int): List<OverlayView.Bull> {
+    private fun detectFrame(y: ByteArray, w: Int, h: Int): DetectResult {
         val targetW = 960
         val scale = targetW.toDouble() / w
         val smallW = targetW
@@ -464,60 +464,127 @@ class MainActivity : AppCompatActivity() {
         full.put(0, 0, y)
         val small = Mat()
         Imgproc.resize(full, small, CvSize(smallW.toDouble(), smallH.toDouble()))
-
-        // Keep a raw copy for contrast measurement (CLAHE distorts absolute values).
         val raw = small.clone()
 
-        clahe.apply(small, small)
-        Imgproc.medianBlur(small, small, 3)
-
-        val circles = Mat()
         try {
-            val minR = 4
-            val maxR = (smallH * 0.15).toInt().coerceAtLeast(30)
-            Imgproc.HoughCircles(
-                small, circles, Imgproc.HOUGH_GRADIENT,
-                1.2,
-                (minR * 3).toDouble(),
-                100.0,
-                22.0,
-                minR,
-                maxR
-            )
-            if (circles.empty()) {
-                Log.d(TAG, "no circles (processed ${smallW}x${smallH}, r=$minR..$maxR)")
-                return emptyList()
+            // --- Stage 1: locate the card ---
+            val cardRectSmall = findCardBounds(raw, smallW, smallH)
+            if (cardRectSmall == null) {
+                Log.d(TAG, "no card found")
+                return DetectResult(emptyList(), null)
             }
-            val n = circles.cols()
 
-            data class Cand(val cx: Float, val cy: Float, val r: Float, val score: Double)
-            val filtered = ArrayList<Cand>(n)
-            val data = FloatArray(3)
-            for (i in 0 until n) {
-                circles.get(0, i, data)
-                val cx = data[0].toInt()
-                val cy = data[1].toInt()
-                val cr = data[2].toInt()
-                val score = bullContrastScore(raw, cx, cy, cr)
-                if (score >= 40.0) {  // ~16% of 0-255 range; real bulls score 60-150
-                    filtered.add(Cand(data[0], data[1], data[2], score))
-                }
-            }
-            filtered.sortByDescending { it.score }
-            Log.d(TAG, "circles: $n raw, ${filtered.size} pass contrast (proc ${smallW}x${smallH})")
+            // --- Stage 2: bull detection inside the card ---
+            val cardMat = raw.submat(cardRectSmall).clone()
+            val cardEnhanced = cardMat.clone()
+            clahe.apply(cardEnhanced, cardEnhanced)
+            Imgproc.medianBlur(cardEnhanced, cardEnhanced, 3)
 
-            return filtered.take(12).map {
-                OverlayView.Bull(
-                    cx = (it.cx / scale).toFloat(),
-                    cy = (it.cy / scale).toFloat(),
-                    r = (it.r / scale).toFloat(),
+            val circles = Mat()
+            val bulls: List<OverlayView.Bull> = try {
+                val minR = 4
+                val maxR = (kmin(cardRectSmall.width, cardRectSmall.height) * 0.25).toInt().coerceAtLeast(20)
+                Imgproc.HoughCircles(
+                    cardEnhanced, circles, Imgproc.HOUGH_GRADIENT,
+                    1.2,
+                    (minR * 3).toDouble(),
+                    100.0,
+                    18.0,   // looser now that we're on-card
+                    minR,
+                    maxR
                 )
+                if (circles.empty()) {
+                    Log.d(TAG, "card found (${cardRectSmall.width}x${cardRectSmall.height}) but no circles")
+                    return DetectResult(emptyList(), toCardOverlay(cardRectSmall, scale))
+                }
+                val n = circles.cols()
+                data class Cand(val cx: Float, val cy: Float, val r: Float, val score: Double)
+                val filtered = ArrayList<Cand>(n)
+                val d = FloatArray(3)
+                for (i in 0 until n) {
+                    circles.get(0, i, d)
+                    val score = bullContrastScore(cardMat, d[0].toInt(), d[1].toInt(), d[2].toInt())
+                    if (score >= 25.0) {  // relaxed from 40 — on-card false positives are rarer
+                        filtered.add(Cand(d[0], d[1], d[2], score))
+                    }
+                }
+                filtered.sortByDescending { it.score }
+                Log.d(TAG, "card ${cardRectSmall.width}x${cardRectSmall.height}: $n raw circles, ${filtered.size} pass contrast")
+                filtered.take(15).map {
+                    // Offset from card-local coords back to small-frame, then to full-res
+                    OverlayView.Bull(
+                        cx = ((it.cx + cardRectSmall.x) / scale).toFloat(),
+                        cy = ((it.cy + cardRectSmall.y) / scale).toFloat(),
+                        r = (it.r / scale).toFloat(),
+                    )
+                }
+            } finally {
+                circles.release()
+                cardMat.release()
+                cardEnhanced.release()
             }
+
+            return DetectResult(bulls, toCardOverlay(cardRectSmall, scale))
         } finally {
             full.release()
             small.release()
             raw.release()
-            circles.release()
+        }
+    }
+
+    private fun toCardOverlay(r: CvRect, scale: Double): OverlayView.CardRect {
+        return OverlayView.CardRect(
+            x = (r.x / scale).toFloat(),
+            y = (r.y / scale).toFloat(),
+            w = (r.width / scale).toFloat(),
+            h = (r.height / scale).toFloat(),
+        )
+    }
+
+    /**
+     * Find the target card: the largest bright rectangular region in the frame.
+     * Uses Otsu threshold + morphological close (to fill in the dark bulls so
+     * they don't fragment the card into multiple contours) + largest contour.
+     * Returns null if nothing above min-area threshold looks card-like.
+     */
+    private fun findCardBounds(gray: Mat, w: Int, h: Int): CvRect? {
+        val thresh = Mat()
+        val closed = Mat()
+        val contours = ArrayList<MatOfPoint>()
+        val hierarchy = Mat()
+        try {
+            Imgproc.threshold(gray, thresh, 0.0, 255.0, Imgproc.THRESH_BINARY + Imgproc.THRESH_OTSU)
+            // Close radius must be > half the largest bull diameter so bull holes fill.
+            val kernelSize = (kmin(w, h) * 0.08).toInt().coerceAtLeast(9)
+            val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, CvSize(kernelSize.toDouble(), kernelSize.toDouble()))
+            Imgproc.morphologyEx(thresh, closed, Imgproc.MORPH_CLOSE, kernel)
+            kernel.release()
+
+            Imgproc.findContours(closed, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+            val frameArea = (w * h).toDouble()
+            val minArea = frameArea * 0.03   // card must be ≥3% of frame
+            val maxArea = frameArea * 0.75   // reject if it's basically the whole frame (over-bright scene)
+            var bestArea = 0.0
+            var bestRect: CvRect? = null
+            for (c in contours) {
+                val area = Imgproc.contourArea(c)
+                if (area < minArea || area > maxArea) continue
+                if (area > bestArea) {
+                    val rect = Imgproc.boundingRect(c)
+                    // Sanity: aspect ratio between 1:3 and 3:1 (cards are roughly rectangular, not slivers)
+                    val ar = rect.width.toDouble() / rect.height
+                    if (ar in 0.3..3.5) {
+                        bestArea = area
+                        bestRect = rect
+                    }
+                }
+            }
+            return bestRect
+        } finally {
+            thresh.release()
+            closed.release()
+            hierarchy.release()
+            contours.forEach { it.release() }
         }
     }
 
