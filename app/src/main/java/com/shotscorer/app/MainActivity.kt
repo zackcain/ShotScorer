@@ -282,6 +282,21 @@ class MainActivity : AppCompatActivity() {
             cameraHelper?.addSurface(binding.preview.holder.surface, false)
             cameraHelper?.startPreview()
             setStatus(getString(R.string.status_opened, w, h))
+
+            try {
+                val cfg = cameraHelper?.videoCaptureConfig
+                if (cfg != null) {
+                    val targetBitrate = ((w * h) * 0.15).toInt().coerceAtLeast(8_000_000)
+                    cfg.setBitRate(targetBitrate)
+                        .setIFrameInterval(1)
+                        .setAudioCaptureEnable(false)
+                    cameraHelper?.videoCaptureConfig = cfg
+                    Log.i(TAG, "VideoCaptureConfig: bitrate=${cfg.bitRate}, iFrame=${cfg.iFrameInterval}, audio=${cfg.audioCaptureEnable}")
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "Failed to tune VideoCaptureConfig", t)
+            }
+
             runOnUiThread {
                 binding.recordButton.isEnabled = true
                 binding.recStatus.text = getString(R.string.rec_idle)
