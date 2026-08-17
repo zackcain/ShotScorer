@@ -415,9 +415,11 @@ class MainActivity : AppCompatActivity() {
         detectionExecutor.execute {
             try {
                 val result = detectBull(yBytes, w, h)
-                if (result != null) {
-                    runOnUiThread {
+                runOnUiThread {
+                    if (result != null) {
                         binding.overlay.updateBull(result.cx, result.cy, result.r, result.quality, w, h)
+                    } else {
+                        binding.overlay.clearBull()
                     }
                 }
             } catch (t: Throwable) {
@@ -439,31 +441,51 @@ class MainActivity : AppCompatActivity() {
         full.put(0, 0, y)
         val small = Mat()
         Imgproc.resize(full, small, CvSize(smallW.toDouble(), smallH.toDouble()))
-        Imgproc.medianBlur(small, small, 5)
+
+        // Restrict search to central 60% ROI — rejects drill/box/shelf clutter
+        val roiW = (smallW * 0.6).toInt()
+        val roiH = (smallH * 0.6).toInt()
+        val roiX = (smallW - roiW) / 2
+        val roiY = (smallH - roiH) / 2
+        val roi = small.submat(roiY, roiY + roiH, roiX, roiX + roiW)
+
+        Imgproc.medianBlur(roi, roi, 5)
 
         val circles = Mat()
         try {
+            // Radius bounds tuned for target that fills ~200-500 px of native 4K.
+            // In the 640-wide small image that's ~30-80 px card, black ring ~10-40 px.
+            val minR = (smallH * 0.02).toInt().coerceAtLeast(5)   // ~4 px @ 360h -> ~24 px @ 4K
+            val maxR = (smallH * 0.20).toInt().coerceAtLeast(30)  // ~72 px @ 360h -> ~430 px @ 4K
             Imgproc.HoughCircles(
-                small, circles, Imgproc.HOUGH_GRADIENT,
-                1.5,
-                (smallH / 4).toDouble(),
-                120.0,
-                30.0,
-                (smallH * 0.02).toInt().coerceAtLeast(6),   // minRadius
-                (smallH * 0.35).toInt()                     // maxRadius
+                roi, circles, Imgproc.HOUGH_GRADIENT,
+                1.2,
+                (smallH / 4).toDouble(),  // minDist between circle centers
+                120.0,                    // Canny edge threshold
+                50.0,                     // accumulator threshold — higher = fewer, stricter
+                minR,
+                maxR
             )
-            if (circles.empty()) return null
+            if (circles.empty()) {
+                Log.d(TAG, "no circles found")
+                return null
+            }
+            Log.d(TAG, "circles found: ${circles.cols()} (roi ${roiW}x${roiH}, r=$minR..$maxR)")
             val data = FloatArray(3)
             circles.get(0, 0, data)
+            // Data is in ROI coords -> shift back to small frame, then upscale to full
+            val smallCx = data[0] + roiX
+            val smallCy = data[1] + roiY
             return BullResult(
-                cx = (data[0] / scale).toFloat(),
-                cy = (data[1] / scale).toFloat(),
+                cx = (smallCx / scale).toFloat(),
+                cy = (smallCy / scale).toFloat(),
                 r = (data[2] / scale).toFloat(),
                 quality = 1.0f,
             )
         } finally {
             full.release()
             small.release()
+            roi.release()
             circles.release()
         }
     }
