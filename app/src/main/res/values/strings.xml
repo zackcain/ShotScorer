@@ -5,4 +5,15 @@
     <string name="status_attached">Camera attached: %1$s</string>
     <string name="status_opened">Preview running (%1$dx%2$d)</string>
     <string name="status_closed">Camera closed</string>
+
+    <string name="btn_record">Record</string>
+    <string name="btn_stop">Stop</string>
+    <string name="rec_idle">Not recording</string>
+    <string name="rec_recording">REC %1$s</string>
+    <string name="rec_saved">Saved: %1$s</string>
+    <string name="rec_error">Record error: %1$s</string>
+
+    <string name="focus_auto">Auto focus</string>
+    <string name="focus_manual_pct">Focus %1$d%%</string>
+    <string name="focus_unsupported">Focus control not supported by this camera</string>
 </resources>
