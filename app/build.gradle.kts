@@ -13,6 +13,12 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "0.1"
+
+        ndk {
+            // Modern Android tablets are arm64-v8a. Skipping other ABIs cuts
+            // the OpenCV AAR from ~90 MB (all four) to ~30 MB.
+            abiFilters += "arm64-v8a"
+        }
     }
 
     signingConfigs {
@@ -57,4 +63,7 @@ dependencies {
 
     // shiyinghan / UVCAndroid
     implementation("com.herohan:UVCAndroid:1.0.13")
+
+    // OpenCV — used for bull detection / hold-trace CV
+    implementation("org.opencv:opencv:4.11.0")
 }

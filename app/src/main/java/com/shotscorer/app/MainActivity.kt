@@ -18,6 +18,8 @@ import com.herohan.uvcapp.ICameraHelper
 import com.herohan.uvcapp.VideoCapture
 import com.serenegiant.usb.UVCControl
 import com.shotscorer.app.databinding.ActivityMainBinding
+import org.opencv.android.OpenCVLoader
+import org.opencv.core.Core
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -38,6 +40,8 @@ class MainActivity : AppCompatActivity() {
     private var isRecording = false
     private var recordingStartMs = 0L
     private var lastFocusWrite = -1
+    private var debugMode = false
+    private var openCvOk = false
     private val timerHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private val timerRunnable = object : Runnable {
         override fun run() {
@@ -55,10 +59,25 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
+        openCvOk = try {
+            OpenCVLoader.initDebug()
+        } catch (t: Throwable) {
+            Log.e(TAG, "OpenCV init threw", t); false
+        }
+        Log.i(TAG, "OpenCV init ok=$openCvOk version=${runCatching { Core.getVersionString() }.getOrElse { "n/a" }}")
+
         binding.preview.setAspectRatio(DEFAULT_WIDTH, DEFAULT_HEIGHT)
         binding.preview.holder.addCallback(surfaceCallback)
 
         binding.recordButton.setOnClickListener { toggleRecording() }
+
+        // Long-press the bottom status bar to toggle debug UI (focus row).
+        binding.status.setOnLongClickListener {
+            debugMode = !debugMode
+            Toast.makeText(this, if (debugMode) "Debug UI on" else "Debug UI off", Toast.LENGTH_SHORT).show()
+            applyFocusUi()
+            true
+        }
 
         binding.afSwitch.setOnCheckedChangeListener { _, checked ->
             val ctrl = cameraHelper?.getUVCControl() ?: return@setOnCheckedChangeListener
@@ -211,7 +230,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyFocusUi() {
         val ctrl: UVCControl? = cameraHelper?.getUVCControl()
-        if (ctrl == null) {
+        if (ctrl == null || !debugMode) {
             binding.focusRow.visibility = android.view.View.GONE
             binding.focusDebug.visibility = android.view.View.GONE
             return
