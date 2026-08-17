@@ -397,7 +397,7 @@ class MainActivity : AppCompatActivity() {
 
     // --- Bull detection ---
 
-    private data class BullResult(val cx: Float, val cy: Float, val r: Float, val quality: Float)
+    private val clahe by lazy { Imgproc.createCLAHE(2.5, CvSize(8.0, 8.0)) }
 
     private val frameCallback = IFrameCallback { frame: ByteBuffer ->
         if (!openCvOk) return@IFrameCallback
@@ -414,12 +414,21 @@ class MainActivity : AppCompatActivity() {
 
         detectionExecutor.execute {
             try {
-                val result = detectBull(yBytes, w, h)
+                val bulls = detectBulls(yBytes, w, h)
                 runOnUiThread {
-                    if (result != null) {
-                        binding.overlay.updateBull(result.cx, result.cy, result.r, result.quality, w, h)
-                    } else {
+                    if (bulls.isEmpty()) {
                         binding.overlay.clearBull()
+                    } else {
+                        // Active bull = closest to frame center (that's where the rifle is aimed)
+                        val cxFrame = w / 2f
+                        val cyFrame = h / 2f
+                        val activeIdx = bulls.indices.minByOrNull { i ->
+                            val b = bulls[i]
+                            val dx = b.cx - cxFrame
+                            val dy = b.cy - cyFrame
+                            dx * dx + dy * dy
+                        } ?: 0
+                        binding.overlay.updateBulls(bulls, activeIdx, w, h)
                     }
                 }
             } catch (t: Throwable) {
@@ -430,9 +439,16 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun detectBull(y: ByteArray, w: Int, h: Int): BullResult? {
-        // Downscale to ~640 wide for speed
-        val targetW = 640
+    /**
+     * Find all bulls in the frame. Returns list in image (full-resolution) coordinates.
+     *
+     * Design constraints:
+     *  - Bulls may be small (10-15 px radius at 20 m in the 640-wide processing image).
+     *  - Multi-bull cards: return every plausible candidate; caller picks which is "active".
+     *  - Camera moves with the rifle: bulls can appear anywhere in the frame, not just centre.
+     */
+    private fun detectBulls(y: ByteArray, w: Int, h: Int): List<OverlayView.Bull> {
+        val targetW = 960  // higher than 640 so small bulls survive downscale
         val scale = targetW.toDouble() / w
         val smallW = targetW
         val smallH = (h * scale).toInt()
@@ -442,50 +458,47 @@ class MainActivity : AppCompatActivity() {
         val small = Mat()
         Imgproc.resize(full, small, CvSize(smallW.toDouble(), smallH.toDouble()))
 
-        // Restrict search to central 60% ROI — rejects drill/box/shelf clutter
-        val roiW = (smallW * 0.6).toInt()
-        val roiH = (smallH * 0.6).toInt()
-        val roiX = (smallW - roiW) / 2
-        val roiY = (smallH - roiH) / 2
-        val roi = small.submat(roiY, roiY + roiH, roiX, roiX + roiW)
-
-        Imgproc.medianBlur(roi, roi, 5)
+        // CLAHE evens out uneven lighting so bull edges vote consistently in Hough.
+        clahe.apply(small, small)
+        Imgproc.medianBlur(small, small, 3)
 
         val circles = Mat()
         try {
-            // Radius bounds tuned for target that fills ~200-500 px of native 4K.
-            // In the 640-wide small image that's ~30-80 px card, black ring ~10-40 px.
-            val minR = (smallH * 0.02).toInt().coerceAtLeast(5)   // ~4 px @ 360h -> ~24 px @ 4K
-            val maxR = (smallH * 0.20).toInt().coerceAtLeast(30)  // ~72 px @ 360h -> ~430 px @ 4K
+            // Radius bounds intentionally wide to cover both current close test
+            // (bull ~20 px) and far small-card case (bull ~5-8 px).
+            val minR = 4
+            val maxR = (smallH * 0.15).toInt().coerceAtLeast(30)
             Imgproc.HoughCircles(
-                roi, circles, Imgproc.HOUGH_GRADIENT,
+                small, circles, Imgproc.HOUGH_GRADIENT,
                 1.2,
-                (smallH / 4).toDouble(),  // minDist between circle centers
-                120.0,                    // Canny edge threshold
-                50.0,                     // accumulator threshold — higher = fewer, stricter
+                (minR * 3).toDouble(),  // minDist — allow tight-packed multi-bull cards
+                100.0,                  // Canny edge threshold
+                25.0,                   // accumulator threshold — permissive; caller ranks
                 minR,
                 maxR
             )
             if (circles.empty()) {
-                Log.d(TAG, "no circles found")
-                return null
+                Log.d(TAG, "no circles (processed ${smallW}x${smallH}, r=$minR..$maxR)")
+                return emptyList()
             }
-            Log.d(TAG, "circles found: ${circles.cols()} (roi ${roiW}x${roiH}, r=$minR..$maxR)")
+            val n = circles.cols()
+            Log.d(TAG, "$n candidate circles (processed ${smallW}x${smallH}, r=$minR..$maxR)")
+            val results = ArrayList<OverlayView.Bull>(n)
             val data = FloatArray(3)
-            circles.get(0, 0, data)
-            // Data is in ROI coords -> shift back to small frame, then upscale to full
-            val smallCx = data[0] + roiX
-            val smallCy = data[1] + roiY
-            return BullResult(
-                cx = (smallCx / scale).toFloat(),
-                cy = (smallCy / scale).toFloat(),
-                r = (data[2] / scale).toFloat(),
-                quality = 1.0f,
-            )
+            for (i in 0 until n.coerceAtMost(12)) {
+                circles.get(0, i, data)
+                results.add(
+                    OverlayView.Bull(
+                        cx = (data[0] / scale).toFloat(),
+                        cy = (data[1] / scale).toFloat(),
+                        r = (data[2] / scale).toFloat(),
+                    )
+                )
+            }
+            return results
         } finally {
             full.release()
             small.release()
-            roi.release()
             circles.release()
         }
     }

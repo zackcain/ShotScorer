@@ -14,79 +14,86 @@ class OverlayView @JvmOverloads constructor(
     defStyle: Int = 0,
 ) : View(context, attrs, defStyle) {
 
-    private data class Bull(
-        val cx: Float,
-        val cy: Float,
-        val r: Float,
-        val quality: Float,
+    data class Bull(val cx: Float, val cy: Float, val r: Float)
+
+    private data class State(
+        val bulls: List<Bull>,
+        val activeIndex: Int,
         val frameW: Int,
         val frameH: Int,
         val timestampMs: Long,
     )
 
     @Volatile
-    private var bull: Bull? = null
+    private var state: State? = null
 
-    private val circlePaint = Paint().apply {
+    private val activeCirclePaint = Paint().apply {
         color = Color.GREEN
         style = Paint.Style.STROKE
         strokeWidth = 4f
         isAntiAlias = true
     }
-
-    private val crossPaint = Paint().apply {
+    private val activeCrossPaint = Paint().apply {
         color = Color.GREEN
         style = Paint.Style.STROKE
         strokeWidth = 3f
         isAntiAlias = true
     }
+    private val inactivePaint = Paint().apply {
+        color = Color.argb(180, 255, 200, 0) // amber, translucent
+        style = Paint.Style.STROKE
+        strokeWidth = 2f
+        isAntiAlias = true
+    }
 
-    fun updateBull(cx: Float, cy: Float, r: Float, quality: Float, frameW: Int, frameH: Int) {
-        bull = Bull(cx, cy, r, quality, frameW, frameH, System.currentTimeMillis())
+    fun updateBulls(bulls: List<Bull>, activeIndex: Int, frameW: Int, frameH: Int) {
+        state = State(bulls, activeIndex, frameW, frameH, System.currentTimeMillis())
         postInvalidate()
     }
 
     fun clearBull() {
-        bull = null
+        state = null
         postInvalidate()
     }
 
     override fun onDraw(canvas: Canvas) {
-        val b = bull ?: return
-        // Drop stale detections after 1s so a lost lock visibly fades away
-        if (System.currentTimeMillis() - b.timestampMs > 1000) return
-        if (b.frameW == 0 || b.frameH == 0) return
+        val s = state ?: return
+        if (System.currentTimeMillis() - s.timestampMs > 1000) return
+        if (s.frameW == 0 || s.frameH == 0) return
 
-        // Frame is letterboxed inside the view. Compute the actual rendered
-        // rectangle assuming AspectRatioSurfaceView-style fit-inside behaviour.
         val viewAspect = width.toFloat() / height
-        val frameAspect = b.frameW.toFloat() / b.frameH
+        val frameAspect = s.frameW.toFloat() / s.frameH
         val renderW: Float
         val renderH: Float
         val offX: Float
         val offY: Float
         if (frameAspect > viewAspect) {
-            // Frame is wider than view -> letterbox top/bottom
             renderW = width.toFloat()
             renderH = width / frameAspect
             offX = 0f
             offY = (height - renderH) / 2f
         } else {
-            // Frame is taller -> pillarbox left/right
             renderH = height.toFloat()
             renderW = height * frameAspect
             offX = (width - renderW) / 2f
             offY = 0f
         }
-        val sx = renderW / b.frameW
-        val sy = renderH / b.frameH
-        val cx = offX + b.cx * sx
-        val cy = offY + b.cy * sy
-        val cr = b.r * min(sx, sy)
+        val sx = renderW / s.frameW
+        val sy = renderH / s.frameH
+        val scale = min(sx, sy)
 
-        canvas.drawCircle(cx, cy, cr, circlePaint)
-        val armLen = cr.coerceAtLeast(30f) * 1.5f
-        canvas.drawLine(cx - armLen, cy, cx + armLen, cy, crossPaint)
-        canvas.drawLine(cx, cy - armLen, cx, cy + armLen, crossPaint)
+        for ((i, b) in s.bulls.withIndex()) {
+            val cx = offX + b.cx * sx
+            val cy = offY + b.cy * sy
+            val cr = b.r * scale
+            if (i == s.activeIndex) {
+                canvas.drawCircle(cx, cy, cr, activeCirclePaint)
+                val armLen = cr.coerceAtLeast(30f) * 1.5f
+                canvas.drawLine(cx - armLen, cy, cx + armLen, cy, activeCrossPaint)
+                canvas.drawLine(cx, cy - armLen, cx, cy + armLen, activeCrossPaint)
+            } else {
+                canvas.drawCircle(cx, cy, cr, inactivePaint)
+            }
+        }
     }
 }
