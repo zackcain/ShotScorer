@@ -16,4 +16,5 @@
     <string name="focus_auto">Auto focus</string>
     <string name="focus_manual_pct">Focus %1$d%%</string>
     <string name="focus_unsupported">Focus control not supported by this camera</string>
+    <string name="focus_debug">AF sup=%1$b, manual sup=%2$b, AF=%3$b, range=%4$d..%5$d, curr=%6$d, wrote=%7$d</string>
 </resources>

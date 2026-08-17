@@ -82,6 +82,16 @@
                 android:textColor="@android:color/white"
                 android:textSize="14sp" />
         </LinearLayout>
+
+        <TextView
+            android:id="@+id/focusDebug"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="4dp"
+            android:textColor="#FFFFDD00"
+            android:textSize="11sp"
+            android:fontFamily="monospace"
+            android:visibility="gone" />
     </LinearLayout>
 
     <TextView

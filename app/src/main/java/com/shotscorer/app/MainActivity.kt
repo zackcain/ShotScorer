@@ -1,10 +1,13 @@
 package com.shotscorer.app
 
+import android.content.ContentValues
 import android.hardware.usb.UsbDevice
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.SystemClock
+import android.provider.MediaStore
 import android.util.Log
 import android.view.SurfaceHolder
 import android.widget.SeekBar
@@ -13,6 +16,7 @@ import androidx.appcompat.app.AppCompatActivity
 import com.herohan.uvcapp.CameraHelper
 import com.herohan.uvcapp.ICameraHelper
 import com.herohan.uvcapp.VideoCapture
+import com.serenegiant.usb.UVCControl
 import com.shotscorer.app.databinding.ActivityMainBinding
 import java.io.File
 import java.text.SimpleDateFormat
@@ -33,6 +37,7 @@ class MainActivity : AppCompatActivity() {
 
     private var isRecording = false
     private var recordingStartMs = 0L
+    private var lastFocusWrite = -1
     private val timerHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private val timerRunnable = object : Runnable {
         override fun run() {
@@ -56,16 +61,14 @@ class MainActivity : AppCompatActivity() {
         binding.recordButton.setOnClickListener { toggleRecording() }
 
         binding.afSwitch.setOnCheckedChangeListener { _, checked ->
-            val helper = cameraHelper ?: return@setOnCheckedChangeListener
-            val ctrl = helper.getUVCControl() ?: return@setOnCheckedChangeListener
+            val ctrl = cameraHelper?.getUVCControl() ?: return@setOnCheckedChangeListener
             try {
-                if (ctrl.isFocusAutoEnable) {
-                    ctrl.focusAuto = checked
-                }
+                if (ctrl.isFocusAutoEnable) ctrl.focusAuto = checked
             } catch (t: Throwable) {
                 Log.w(TAG, "AF toggle failed", t)
             }
-            binding.focusSlider.isEnabled = !checked && (ctrl.isFocusAbsoluteEnable)
+            binding.focusSlider.isEnabled = !checked && ctrl.isFocusAbsoluteEnable
+            refreshFocusDebug()
         }
 
         binding.focusSlider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
@@ -74,12 +77,19 @@ class MainActivity : AppCompatActivity() {
                 if (!fromUser) return
                 val ctrl = cameraHelper?.getUVCControl() ?: return
                 try {
+                    if (ctrl.isFocusAutoEnable && ctrl.focusAuto) {
+                        ctrl.focusAuto = false
+                        binding.afSwitch.isChecked = false
+                    }
                     if (ctrl.isFocusAbsoluteEnable) {
                         ctrl.setFocusAbsolutePercent(progress)
+                        lastFocusWrite = progress
+                        Log.d(TAG, "focus write %=$progress → read %=${runCatching { ctrl.focusAbsolutePercent }.getOrElse { -1 }} absVal=${runCatching { ctrl.focusAbsolute }.getOrElse { -1 }}")
                     }
                 } catch (t: Throwable) {
                     Log.w(TAG, "Focus set failed", t)
                 }
+                refreshFocusDebug()
             }
             override fun onStartTrackingTouch(sb: SeekBar) {}
             override fun onStopTrackingTouch(sb: SeekBar) {}
@@ -111,25 +121,22 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread {
             binding.recordButton.isEnabled = false
             binding.focusRow.visibility = android.view.View.GONE
+            binding.focusDebug.visibility = android.view.View.GONE
         }
     }
 
     private fun toggleRecording() {
         val helper = cameraHelper ?: return
-        if (helper.isRecording) {
-            stopRecordingSafely()
-        } else {
-            startRecordingSafely(helper)
-        }
+        if (helper.isRecording) stopRecordingSafely() else startRecordingSafely(helper)
     }
 
     private fun startRecordingSafely(helper: ICameraHelper) {
         val dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir
         if (!dir.exists()) dir.mkdirs()
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-        val outFile = File(dir, "ShotScorer-$stamp.mp4")
+        val tempFile = File(dir, "ShotScorer-$stamp.mp4")
 
-        val options = VideoCapture.OutputFileOptions.Builder(outFile).build()
+        val options = VideoCapture.OutputFileOptions.Builder(tempFile).build()
         try {
             helper.startRecording(options, object : VideoCapture.OnVideoCaptureCallback {
                 override fun onStart() {
@@ -141,13 +148,13 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 override fun onVideoSaved(results: VideoCapture.OutputFileResults) {
-                    val uri: Uri? = results.savedUri
-                    Log.i(TAG, "Video saved: $uri (path=${outFile.absolutePath})")
+                    Log.i(TAG, "Recording saved to temp: ${tempFile.absolutePath}")
+                    val publicPath = publishToMovies(tempFile)
                     runOnUiThread {
                         isRecording = false
                         binding.recordButton.text = getString(R.string.btn_record)
-                        binding.recStatus.text = getString(R.string.rec_saved, outFile.name)
-                        Toast.makeText(this@MainActivity, outFile.absolutePath, Toast.LENGTH_LONG).show()
+                        binding.recStatus.text = getString(R.string.rec_saved, publicPath ?: tempFile.name)
+                        Toast.makeText(this@MainActivity, "Saved to $publicPath", Toast.LENGTH_LONG).show()
                     }
                 }
                 override fun onError(code: Int, message: String, cause: Throwable?) {
@@ -165,6 +172,34 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun publishToMovies(source: File): String? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return source.absolutePath  // pre-scoped-storage: leave in place
+        }
+        return try {
+            val values = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, source.name)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/ShotScorer")
+                put(MediaStore.Video.Media.IS_PENDING, 1)
+            }
+            val uri: Uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                ?: return source.absolutePath
+            contentResolver.openOutputStream(uri).use { out ->
+                if (out == null) return source.absolutePath
+                source.inputStream().use { input -> input.copyTo(out) }
+            }
+            contentResolver.update(uri, ContentValues().apply {
+                put(MediaStore.Video.Media.IS_PENDING, 0)
+            }, null, null)
+            source.delete()
+            "Movies/ShotScorer/${source.name}"
+        } catch (t: Throwable) {
+            Log.e(TAG, "publishToMovies failed", t)
+            source.absolutePath
+        }
+    }
+
     private fun stopRecordingSafely() {
         try {
             cameraHelper?.stopRecording()
@@ -175,10 +210,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun applyFocusUi() {
-        val helper = cameraHelper ?: return
-        val ctrl = helper.getUVCControl()
+        val ctrl: UVCControl? = cameraHelper?.getUVCControl()
         if (ctrl == null) {
             binding.focusRow.visibility = android.view.View.GONE
+            binding.focusDebug.visibility = android.view.View.GONE
             return
         }
         val afSupported = try { ctrl.isFocusAutoEnable } catch (_: Throwable) { false }
@@ -186,10 +221,12 @@ class MainActivity : AppCompatActivity() {
 
         if (!afSupported && !manualSupported) {
             binding.focusRow.visibility = android.view.View.GONE
+            binding.focusDebug.visibility = android.view.View.GONE
             binding.recStatus.text = getString(R.string.focus_unsupported)
             return
         }
         binding.focusRow.visibility = android.view.View.VISIBLE
+        binding.focusDebug.visibility = android.view.View.VISIBLE
 
         binding.afSwitch.isEnabled = afSupported
         val afOn = if (afSupported) {
@@ -205,6 +242,20 @@ class MainActivity : AppCompatActivity() {
         } else {
             binding.focusValue.text = ""
         }
+        refreshFocusDebug()
+    }
+
+    private fun refreshFocusDebug() {
+        val ctrl = cameraHelper?.getUVCControl() ?: return
+        val afSup = runCatching { ctrl.isFocusAutoEnable }.getOrElse { false }
+        val manSup = runCatching { ctrl.isFocusAbsoluteEnable }.getOrElse { false }
+        val af = runCatching { ctrl.focusAuto }.getOrElse { false }
+        val limits = runCatching { ctrl.updateFocusAbsoluteLimit() }.getOrElse { intArrayOf(0, 0) }
+        val lo = if (limits.isNotEmpty()) limits[0] else 0
+        val hi = if (limits.size >= 2) limits[1] else 0
+        val curr = runCatching { ctrl.focusAbsolutePercent }.getOrElse { -1 }
+        binding.focusDebug.text = getString(R.string.focus_debug, afSup, manSup, af, lo, hi, curr, lastFocusWrite)
+        Log.d(TAG, "focus dbg: AFsup=$afSup manSup=$manSup AF=$af range=$lo..$hi curr%=$curr wrote%=$lastFocusWrite absVal=${runCatching { ctrl.focusAbsolute }.getOrElse { -1 }}")
     }
 
     private val stateCallback = object : ICameraHelper.StateCallback {
@@ -245,6 +296,7 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 binding.recordButton.isEnabled = false
                 binding.focusRow.visibility = android.view.View.GONE
+                binding.focusDebug.visibility = android.view.View.GONE
             }
         }
 
