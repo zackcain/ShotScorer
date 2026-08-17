@@ -24,11 +24,13 @@ import org.opencv.android.OpenCVLoader
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
+import org.opencv.core.Rect as CvRect
 import org.opencv.core.Size as CvSize
 import org.opencv.imgproc.Imgproc
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.min as kmin
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -440,15 +442,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Find all bulls in the frame. Returns list in image (full-resolution) coordinates.
+     * Find all bulls in the frame. Returns list in image (full-resolution) coordinates,
+     * ordered best-first by contrast score.
      *
-     * Design constraints:
-     *  - Bulls may be small (10-15 px radius at 20 m in the 640-wide processing image).
-     *  - Multi-bull cards: return every plausible candidate; caller picks which is "active".
-     *  - Camera moves with the rifle: bulls can appear anywhere in the frame, not just centre.
+     * Pipeline:
+     *  1. Downscale to ~960 wide for HoughCircles speed.
+     *  2. CLAHE + median blur to normalise lighting.
+     *  3. HoughCircles with permissive thresholds — cast a wide net.
+     *  4. For each candidate, compute a "bull-ness" score: (outer_bright - inner_dark).
+     *     Real bulls are dark disks on light backgrounds → high positive score.
+     *     Scene clutter (drills, box edges) → near-zero or negative.
+     *  5. Keep only candidates with score above a threshold.
      */
     private fun detectBulls(y: ByteArray, w: Int, h: Int): List<OverlayView.Bull> {
-        val targetW = 960  // higher than 640 so small bulls survive downscale
+        val targetW = 960
         val scale = targetW.toDouble() / w
         val smallW = targetW
         val smallH = (h * scale).toInt()
@@ -458,22 +465,22 @@ class MainActivity : AppCompatActivity() {
         val small = Mat()
         Imgproc.resize(full, small, CvSize(smallW.toDouble(), smallH.toDouble()))
 
-        // CLAHE evens out uneven lighting so bull edges vote consistently in Hough.
+        // Keep a raw copy for contrast measurement (CLAHE distorts absolute values).
+        val raw = small.clone()
+
         clahe.apply(small, small)
         Imgproc.medianBlur(small, small, 3)
 
         val circles = Mat()
         try {
-            // Radius bounds intentionally wide to cover both current close test
-            // (bull ~20 px) and far small-card case (bull ~5-8 px).
             val minR = 4
             val maxR = (smallH * 0.15).toInt().coerceAtLeast(30)
             Imgproc.HoughCircles(
                 small, circles, Imgproc.HOUGH_GRADIENT,
                 1.2,
-                (minR * 3).toDouble(),  // minDist — allow tight-packed multi-bull cards
-                100.0,                  // Canny edge threshold
-                25.0,                   // accumulator threshold — permissive; caller ranks
+                (minR * 3).toDouble(),
+                100.0,
+                22.0,
                 minR,
                 maxR
             )
@@ -482,24 +489,79 @@ class MainActivity : AppCompatActivity() {
                 return emptyList()
             }
             val n = circles.cols()
-            Log.d(TAG, "$n candidate circles (processed ${smallW}x${smallH}, r=$minR..$maxR)")
-            val results = ArrayList<OverlayView.Bull>(n)
+
+            data class Cand(val cx: Float, val cy: Float, val r: Float, val score: Double)
+            val filtered = ArrayList<Cand>(n)
             val data = FloatArray(3)
-            for (i in 0 until n.coerceAtMost(12)) {
+            for (i in 0 until n) {
                 circles.get(0, i, data)
-                results.add(
-                    OverlayView.Bull(
-                        cx = (data[0] / scale).toFloat(),
-                        cy = (data[1] / scale).toFloat(),
-                        r = (data[2] / scale).toFloat(),
-                    )
+                val cx = data[0].toInt()
+                val cy = data[1].toInt()
+                val cr = data[2].toInt()
+                val score = bullContrastScore(raw, cx, cy, cr)
+                if (score >= 40.0) {  // ~16% of 0-255 range; real bulls score 60-150
+                    filtered.add(Cand(data[0], data[1], data[2], score))
+                }
+            }
+            filtered.sortByDescending { it.score }
+            Log.d(TAG, "circles: $n raw, ${filtered.size} pass contrast (proc ${smallW}x${smallH})")
+
+            return filtered.take(12).map {
+                OverlayView.Bull(
+                    cx = (it.cx / scale).toFloat(),
+                    cy = (it.cy / scale).toFloat(),
+                    r = (it.r / scale).toFloat(),
                 )
             }
-            return results
         } finally {
             full.release()
             small.release()
+            raw.release()
             circles.release()
+        }
+    }
+
+    /**
+     * Score how "bull-like" a candidate circle is: mean brightness of a small
+     * outer annulus minus mean brightness of the disk interior. Positive =
+     * dark-on-light (a real bull). Uses bounding-box means for speed; a mask
+     * would be more accurate but ~5× slower and this is fine for filtering.
+     */
+    private fun bullContrastScore(gray: Mat, cx: Int, cy: Int, r: Int): Double {
+        val w = gray.cols()
+        val h = gray.rows()
+        if (r < 3) return 0.0
+
+        val innerR = (r * 0.7).toInt().coerceAtLeast(2)
+        val innerX = (cx - innerR).coerceAtLeast(0)
+        val innerY = (cy - innerR).coerceAtLeast(0)
+        val innerW = kmin(2 * innerR, w - innerX)
+        val innerH = kmin(2 * innerR, h - innerY)
+        if (innerW <= 0 || innerH <= 0) return 0.0
+
+        val outerR = (r * 1.6).toInt()
+        val outerX = (cx - outerR).coerceAtLeast(0)
+        val outerY = (cy - outerR).coerceAtLeast(0)
+        val outerW = kmin(2 * outerR, w - outerX)
+        val outerH = kmin(2 * outerR, h - outerY)
+        if (outerW <= 0 || outerH <= 0) return 0.0
+
+        val inner = gray.submat(CvRect(innerX, innerY, innerW, innerH))
+        val outer = gray.submat(CvRect(outerX, outerY, outerW, outerH))
+        return try {
+            val innerMean = Core.mean(inner).`val`[0]
+            val outerMean = Core.mean(outer).`val`[0]
+            // outerMean is a mix of the disk and its surround; the SURROUND-only
+            // mean is approximated by weighting up: outerMean = a*inner + (1-a)*surround
+            // where a = (innerArea / outerArea). Solve for surround.
+            val innerArea = (innerW * innerH).toDouble()
+            val outerArea = (outerW * outerH).toDouble()
+            val a = innerArea / outerArea
+            val surroundMean = if (a < 1.0) (outerMean - a * innerMean) / (1.0 - a) else outerMean
+            surroundMean - innerMean
+        } finally {
+            inner.release()
+            outer.release()
         }
     }
 }
