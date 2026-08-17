@@ -16,10 +16,19 @@ import androidx.appcompat.app.AppCompatActivity
 import com.herohan.uvcapp.CameraHelper
 import com.herohan.uvcapp.ICameraHelper
 import com.herohan.uvcapp.VideoCapture
+import com.serenegiant.usb.IFrameCallback
+import com.serenegiant.usb.UVCCamera
 import com.serenegiant.usb.UVCControl
 import com.shotscorer.app.databinding.ActivityMainBinding
 import org.opencv.android.OpenCVLoader
 import org.opencv.core.Core
+import org.opencv.core.CvType
+import org.opencv.core.Mat
+import org.opencv.core.Size as CvSize
+import org.opencv.imgproc.Imgproc
+import java.nio.ByteBuffer
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -42,6 +51,11 @@ class MainActivity : AppCompatActivity() {
     private var lastFocusWrite = -1
     private var debugMode = false
     private var openCvOk = false
+
+    private val detectionExecutor = Executors.newSingleThreadExecutor()
+    private val detecting = AtomicBoolean(false)
+    private var frameCallbackRegistered = false
+    private var detectionByteBuffer = ByteArray(0)
     private val timerHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private val timerRunnable = object : Runnable {
         override fun run() {
@@ -316,6 +330,16 @@ class MainActivity : AppCompatActivity() {
                 Log.w(TAG, "Failed to tune VideoCaptureConfig", t)
             }
 
+            if (openCvOk && !frameCallbackRegistered) {
+                try {
+                    cameraHelper?.setFrameCallback(frameCallback, UVCCamera.PIXEL_FORMAT_NV21)
+                    frameCallbackRegistered = true
+                    Log.i(TAG, "Frame callback registered (NV21)")
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Failed to register frame callback", t)
+                }
+            }
+
             runOnUiThread {
                 binding.recordButton.isEnabled = true
                 binding.recStatus.text = getString(R.string.rec_idle)
@@ -327,10 +351,12 @@ class MainActivity : AppCompatActivity() {
             Log.d(TAG, "onCameraClose ${device.deviceName}")
             if (isRecording) stopRecordingSafely()
             cameraHelper?.removeSurface(binding.preview.holder.surface)
+            frameCallbackRegistered = false
             runOnUiThread {
                 binding.recordButton.isEnabled = false
                 binding.focusRow.visibility = android.view.View.GONE
                 binding.focusDebug.visibility = android.view.View.GONE
+                binding.overlay.clearBull()
             }
         }
 
@@ -367,5 +393,78 @@ class MainActivity : AppCompatActivity() {
 
     private fun setStatus(text: String) {
         runOnUiThread { binding.status.text = text }
+    }
+
+    // --- Bull detection ---
+
+    private data class BullResult(val cx: Float, val cy: Float, val r: Float, val quality: Float)
+
+    private val frameCallback = IFrameCallback { frame: ByteBuffer ->
+        if (!openCvOk) return@IFrameCallback
+        val size = cameraHelper?.previewSize ?: return@IFrameCallback
+        val w = size.width
+        val h = size.height
+        val ySize = w * h
+        if (frame.remaining() < ySize) return@IFrameCallback
+        if (!detecting.compareAndSet(false, true)) return@IFrameCallback  // busy
+
+        if (detectionByteBuffer.size < ySize) detectionByteBuffer = ByteArray(ySize)
+        frame.get(detectionByteBuffer, 0, ySize)
+        val yBytes = detectionByteBuffer
+
+        detectionExecutor.execute {
+            try {
+                val result = detectBull(yBytes, w, h)
+                if (result != null) {
+                    runOnUiThread {
+                        binding.overlay.updateBull(result.cx, result.cy, result.r, result.quality, w, h)
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "detection failed", t)
+            } finally {
+                detecting.set(false)
+            }
+        }
+    }
+
+    private fun detectBull(y: ByteArray, w: Int, h: Int): BullResult? {
+        // Downscale to ~640 wide for speed
+        val targetW = 640
+        val scale = targetW.toDouble() / w
+        val smallW = targetW
+        val smallH = (h * scale).toInt()
+
+        val full = Mat(h, w, CvType.CV_8UC1)
+        full.put(0, 0, y)
+        val small = Mat()
+        Imgproc.resize(full, small, CvSize(smallW.toDouble(), smallH.toDouble()))
+        Imgproc.medianBlur(small, small, 5)
+
+        val circles = Mat()
+        try {
+            Imgproc.HoughCircles(
+                small, circles, Imgproc.HOUGH_GRADIENT,
+                1.5,
+                (smallH / 4).toDouble(),
+                120.0,
+                30.0,
+                (smallH * 0.02).toInt().coerceAtLeast(6),   // minRadius
+                (smallH * 0.35).toInt()                     // maxRadius
+            )
+            if (circles.empty()) return null
+            val data = FloatArray(3)
+            circles.get(0, 0, data)
+            return BullResult(
+                cx = (data[0] / scale).toFloat(),
+                cy = (data[1] / scale).toFloat(),
+                r = (data[2] / scale).toFloat(),
+                quality = 1.0f,
+            )
+        } finally {
+            full.release()
+            small.release()
+            circles.release()
+        }
     }
 }
