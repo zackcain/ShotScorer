@@ -1,6 +1,8 @@
 package com.shotscorer.app
 
+import android.Manifest
 import android.content.ContentValues
+import android.content.pm.PackageManager
 import android.hardware.usb.UsbDevice
 import android.net.Uri
 import android.os.Build
@@ -12,7 +14,9 @@ import android.util.Log
 import android.view.SurfaceHolder
 import android.widget.SeekBar
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import com.herohan.uvcapp.CameraHelper
 import com.herohan.uvcapp.ICameraHelper
 import com.herohan.uvcapp.VideoCapture
@@ -60,6 +64,9 @@ class MainActivity : AppCompatActivity() {
         // If active bull jumps more than this many bull-radii between frames,
         // treat as a new aim (different bull entirely) and reset the trace.
         private const val TRACE_RESET_JUMP_MUL = 3.0f
+
+        // Keep the last N shot markers on screen.
+        private const val MAX_SHOTS_SHOWN = 15
     }
 
     private lateinit var binding: ActivityMainBinding
@@ -82,6 +89,24 @@ class MainActivity : AppCompatActivity() {
     private val aimTrace: ArrayDeque<OverlayView.AimSample> = ArrayDeque()
     private var lastBullCx = 0f
     private var lastBullCy = 0f
+
+    /** Recent shot markers, positioned at where the aim was when the sound
+     *  fired. Numbered 1..N in the order they landed. */
+    private val shots: ArrayDeque<OverlayView.ShotMarker> = ArrayDeque()
+    private var shotCounter = 0
+
+    private var shotDetector: ShotDetector? = null
+    private var audioPermissionAsked = false
+    private val requestAudioPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) {
+                Log.i(TAG, "audio permission granted")
+                if (cameraHelper?.isCameraOpened == true) tryStartShotDetector()
+            } else {
+                Log.i(TAG, "audio permission denied — shot detection off")
+                Toast.makeText(this, "Mic denied — shot detection disabled", Toast.LENGTH_SHORT).show()
+            }
+        }
     private val timerHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private val timerRunnable = object : Runnable {
         override fun run() {
@@ -118,6 +143,9 @@ class MainActivity : AppCompatActivity() {
             applyFocusUi()
             true
         }
+
+        // Request mic permission early so shot detection is ready when camera opens.
+        ensureAudioPermission()
 
         binding.afSwitch.setOnCheckedChangeListener { _, checked ->
             val ctrl = cameraHelper?.getUVCControl() ?: return@setOnCheckedChangeListener
@@ -366,6 +394,8 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
+            tryStartShotDetector()
+
             runOnUiThread {
                 binding.recordButton.isEnabled = true
                 binding.recStatus.text = getString(R.string.rec_idle)
@@ -379,6 +409,9 @@ class MainActivity : AppCompatActivity() {
             cameraHelper?.removeSurface(binding.preview.holder.surface)
             frameCallbackRegistered = false
             aimTrace.clear()
+            shots.clear()
+            shotCounter = 0
+            stopShotDetector()
             runOnUiThread {
                 binding.recordButton.isEnabled = false
                 binding.focusRow.visibility = android.view.View.GONE
@@ -420,6 +453,53 @@ class MainActivity : AppCompatActivity() {
 
     private fun setStatus(text: String) {
         runOnUiThread { binding.status.text = text }
+    }
+
+    // --- Shot detection ---
+
+    private fun ensureAudioPermission() {
+        val granted = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.RECORD_AUDIO,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (granted) return
+        if (audioPermissionAsked) return
+        audioPermissionAsked = true
+        requestAudioPermission.launch(Manifest.permission.RECORD_AUDIO)
+    }
+
+    private fun tryStartShotDetector() {
+        if (shotDetector != null) return
+        val granted = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.RECORD_AUDIO,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!granted) {
+            ensureAudioPermission()
+            return
+        }
+        val detector = ShotDetector { onShotHeard() }
+        if (detector.start()) {
+            shotDetector = detector
+            Log.i(TAG, "shot detector running")
+        } else {
+            Log.w(TAG, "shot detector failed to start")
+        }
+    }
+
+    private fun stopShotDetector() {
+        shotDetector?.stop()
+        shotDetector = null
+    }
+
+    /** Called from the audio thread when a shot is heard. Marshals to UI
+     *  and captures the current aim as a shot marker. */
+    private fun onShotHeard() {
+        runOnUiThread {
+            val current = aimTrace.lastOrNull() ?: return@runOnUiThread
+            shotCounter += 1
+            shots.addLast(OverlayView.ShotMarker(current.dx, current.dy, shotCounter))
+            while (shots.size > MAX_SHOTS_SHOWN) shots.removeFirst()
+            Toast.makeText(this, "Shot #$shotCounter", Toast.LENGTH_SHORT).show()
+        }
     }
 
     // --- Bull detection ---
@@ -474,7 +554,8 @@ class MainActivity : AppCompatActivity() {
                         }
 
                         binding.overlay.updateFrame(
-                            result.bulls, activeIdx, result.card, aimTrace.toList(), w, h,
+                            result.bulls, activeIdx, result.card,
+                            aimTrace.toList(), shots.toList(), w, h,
                         )
                     }
                 }

@@ -22,11 +22,16 @@ class OverlayView @JvmOverloads constructor(
      *  sample was captured, expressed in FULL-resolution image pixels. */
     data class AimSample(val dx: Float, val dy: Float)
 
+    /** A shot event: same coordinate frame as AimSample, plus an ordinal
+     *  number for the display label (1, 2, 3 …). */
+    data class ShotMarker(val dx: Float, val dy: Float, val number: Int)
+
     private data class State(
         val bulls: List<Bull>,
         val activeIndex: Int,
         val card: CardRect?,
         val trace: List<AimSample>,
+        val shots: List<ShotMarker>,
         val frameW: Int,
         val frameH: Int,
         val timestampMs: Long,
@@ -70,16 +75,34 @@ class OverlayView @JvmOverloads constructor(
         style = Paint.Style.FILL
         isAntiAlias = true
     }
+    private val shotDotPaint = Paint().apply {
+        color = Color.rgb(255, 60, 60)
+        style = Paint.Style.FILL
+        isAntiAlias = true
+    }
+    private val shotRingPaint = Paint().apply {
+        color = Color.rgb(255, 220, 220)
+        style = Paint.Style.STROKE
+        strokeWidth = 2f
+        isAntiAlias = true
+    }
+    private val shotLabelPaint = Paint().apply {
+        color = Color.WHITE
+        textSize = 24f
+        isAntiAlias = true
+        isFakeBoldText = true
+    }
 
     fun updateFrame(
         bulls: List<Bull>,
         activeIndex: Int,
         card: CardRect?,
         trace: List<AimSample>,
+        shots: List<ShotMarker>,
         frameW: Int,
         frameH: Int,
     ) {
-        state = State(bulls, activeIndex, card, trace, frameW, frameH, System.currentTimeMillis())
+        state = State(bulls, activeIndex, card, trace, shots, frameW, frameH, System.currentTimeMillis())
         postInvalidate()
     }
 
@@ -161,6 +184,17 @@ class OverlayView @JvmOverloads constructor(
             }
             // "Where the rifle is pointing right now" — a small white dot at the head.
             canvas.drawCircle(prevX, prevY, 5f, traceHeadPaint)
+        }
+
+        // Shot markers — anchored to the active bull, same coord frame as trace.
+        if (s.activeIndex in s.bulls.indices) {
+            for (shot in s.shots) {
+                val sxPx = activeCx + shot.dx * sx
+                val syPx = activeCy + shot.dy * sy
+                canvas.drawCircle(sxPx, syPx, 7f, shotDotPaint)
+                canvas.drawCircle(sxPx, syPx, 11f, shotRingPaint)
+                canvas.drawText(shot.number.toString(), sxPx + 14f, syPx - 8f, shotLabelPaint)
+            }
         }
     }
 }
