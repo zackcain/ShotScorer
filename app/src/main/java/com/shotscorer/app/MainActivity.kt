@@ -43,6 +43,17 @@ class MainActivity : AppCompatActivity() {
         private const val TAG = "ShotScorer"
         private const val DEFAULT_WIDTH = 1280
         private const val DEFAULT_HEIGHT = 720
+
+        // Detector params — tuned locally against real range footage in
+        // tools/detect.py. Keep in sync with that script's constants.
+        private const val BULL_MIN_R = 4
+        private const val BULL_MAX_R_ABS = 18
+        private const val BULL_MAX_R_FRAC = 0.10
+        private const val CONTRAST_THRESHOLD = 40.0
+        private const val NMS_OVERLAP_R_MUL = 1.0f
+        private const val MAX_BULLS_KEPT = 200
+        private const val CLUSTER_MIN_BULLS = 3
+        private const val CLUSTER_EPS_R_MUL = 4.0f
     }
 
     private lateinit var binding: ActivityMainBinding
@@ -442,17 +453,21 @@ class MainActivity : AppCompatActivity() {
     }
 
     private data class DetectResult(val bulls: List<OverlayView.Bull>, val card: OverlayView.CardRect?)
+    private data class Cand(val cx: Float, val cy: Float, val r: Float, val score: Double)
 
     /**
-     * Two-stage pipeline:
-     *   1. Find the card — largest bright rectangular region in the frame.
-     *   2. Run HoughCircles restricted to that region, then filter by dark-disk contrast.
+     * Cluster-based detection (tuned against ShotScorer/tools/detect.py).
+     *   1. Hough on the whole downscaled frame with wide radius net.
+     *   2. Filter candidates by dark-inside/light-outside contrast (>= 40).
+     *   3. Non-max suppression: drop lower-scoring overlaps.
+     *   4. Cluster survivors by spatial proximity (union-find).
+     *   5. Pick the largest cluster (tiebreak: closest to frame centre) as
+     *      the "active card". Its bounding box becomes the card overlay.
      *
-     * Rationale: at rifle-range setups the target CARD is the dominant bright
-     * object in view. Non-card regions (garage wall, tire, shelving) produce
-     * plenty of dark-on-light gradients that fool a whole-frame Hough sweep.
-     * Constraining to the card eliminates those and lets us tighten per-bull
-     * thresholds because we know we're on target paper.
+     * Rationale: at real ranges, brightness-based card detection fails (the
+     * whole wall is bright). Real bulls score 55-90 on contrast; scene
+     * clutter (bullet holes, wood grain, shadows) scores < 40. That gap
+     * eliminates false positives before clustering runs.
      */
     private fun detectFrame(y: ByteArray, w: Int, h: Int): DetectResult {
         val targetW = 960
@@ -467,64 +482,80 @@ class MainActivity : AppCompatActivity() {
         val raw = small.clone()
 
         try {
-            // --- Stage 1: locate the card ---
-            val cardRectSmall = findCardBounds(raw, smallW, smallH)
-            if (cardRectSmall == null) {
-                Log.d(TAG, "no card found")
-                return DetectResult(emptyList(), null)
-            }
-
-            // --- Stage 2: bull detection inside the card ---
-            val cardMat = raw.submat(cardRectSmall).clone()
-            val cardEnhanced = cardMat.clone()
-            clahe.apply(cardEnhanced, cardEnhanced)
-            Imgproc.medianBlur(cardEnhanced, cardEnhanced, 3)
+            val enhanced = raw.clone()
+            clahe.apply(enhanced, enhanced)
+            Imgproc.medianBlur(enhanced, enhanced, 3)
 
             val circles = Mat()
-            val bulls: List<OverlayView.Bull> = try {
-                val minR = 4
-                val maxR = (kmin(cardRectSmall.width, cardRectSmall.height) * 0.25).toInt().coerceAtLeast(20)
+            val cands: List<Cand> = try {
+                val minR = BULL_MIN_R
+                val maxR = kmin(BULL_MAX_R_ABS,
+                    (kmin(smallW, smallH) * BULL_MAX_R_FRAC).toInt().coerceAtLeast(20))
                 Imgproc.HoughCircles(
-                    cardEnhanced, circles, Imgproc.HOUGH_GRADIENT,
+                    enhanced, circles, Imgproc.HOUGH_GRADIENT,
                     1.2,
                     (minR * 3).toDouble(),
                     100.0,
-                    18.0,   // looser now that we're on-card
+                    13.0,
                     minR,
                     maxR
                 )
                 if (circles.empty()) {
-                    Log.d(TAG, "card found (${cardRectSmall.width}x${cardRectSmall.height}) but no circles")
-                    return DetectResult(emptyList(), toCardOverlay(cardRectSmall, scale))
+                    Log.d(TAG, "no circles (proc ${smallW}x${smallH})")
+                    return DetectResult(emptyList(), null)
                 }
                 val n = circles.cols()
-                data class Cand(val cx: Float, val cy: Float, val r: Float, val score: Double)
-                val filtered = ArrayList<Cand>(n)
+                val list = ArrayList<Cand>(n)
                 val d = FloatArray(3)
                 for (i in 0 until n) {
                     circles.get(0, i, d)
-                    val score = bullContrastScore(cardMat, d[0].toInt(), d[1].toInt(), d[2].toInt())
-                    if (score >= 25.0) {  // relaxed from 40 — on-card false positives are rarer
-                        filtered.add(Cand(d[0], d[1], d[2], score))
-                    }
+                    val score = bullContrastScore(raw, d[0].toInt(), d[1].toInt(), d[2].toInt())
+                    if (score >= CONTRAST_THRESHOLD) list.add(Cand(d[0], d[1], d[2], score))
                 }
-                filtered.sortByDescending { it.score }
-                Log.d(TAG, "card ${cardRectSmall.width}x${cardRectSmall.height}: $n raw circles, ${filtered.size} pass contrast")
-                filtered.take(15).map {
-                    // Offset from card-local coords back to small-frame, then to full-res
-                    OverlayView.Bull(
-                        cx = ((it.cx + cardRectSmall.x) / scale).toFloat(),
-                        cy = ((it.cy + cardRectSmall.y) / scale).toFloat(),
-                        r = (it.r / scale).toFloat(),
-                    )
-                }
+                list.sortByDescending { it.score }
+                nonMaxSuppress(list)
             } finally {
                 circles.release()
-                cardMat.release()
-                cardEnhanced.release()
+                enhanced.release()
             }
 
-            return DetectResult(bulls, toCardOverlay(cardRectSmall, scale))
+            Log.d(TAG, "circles after contrast+NMS: ${cands.size}")
+            if (cands.isEmpty()) return DetectResult(emptyList(), null)
+
+            val clusters = clusterByProximity(cands, CLUSTER_EPS_R_MUL)
+            val valid = clusters.filter { it.size >= CLUSTER_MIN_BULLS }
+            if (valid.isEmpty()) {
+                // No confident card — show survivors amber, no card box.
+                val all = cands.map { toBull(it, scale) }
+                return DetectResult(all.take(15), null)
+            }
+
+            val fcx = smallW / 2f
+            val fcy = smallH / 2f
+            val aim = valid.maxByOrNull { g ->
+                val meanX = g.map { it.cx }.average().toFloat()
+                val meanY = g.map { it.cy }.average().toFloat()
+                // Primary: count. Tiebreak: closeness to centre (negate distance).
+                g.size.toDouble() -
+                    (((meanX - fcx) * (meanX - fcx) + (meanY - fcy) * (meanY - fcy)) / 1e9)
+            }!!
+
+            val bulls = aim.map { toBull(it, scale) }
+            val xs = aim.map { it.cx }
+            val ys = aim.map { it.cy }
+            val rs = aim.map { it.r }
+            val pad = (rs.max()) * 1.2f
+            val x0 = (xs.min() - pad).coerceAtLeast(0f)
+            val y0 = (ys.min() - pad).coerceAtLeast(0f)
+            val x1 = (xs.max() + pad).coerceAtMost(smallW.toFloat())
+            val y1 = (ys.max() + pad).coerceAtMost(smallH.toFloat())
+            val card = OverlayView.CardRect(
+                x = (x0 / scale).toFloat(),
+                y = (y0 / scale).toFloat(),
+                w = ((x1 - x0) / scale).toFloat(),
+                h = ((y1 - y0) / scale).toFloat(),
+            )
+            return DetectResult(bulls, card)
         } finally {
             full.release()
             small.release()
@@ -532,61 +563,52 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun toCardOverlay(r: CvRect, scale: Double): OverlayView.CardRect {
-        return OverlayView.CardRect(
-            x = (r.x / scale).toFloat(),
-            y = (r.y / scale).toFloat(),
-            w = (r.width / scale).toFloat(),
-            h = (r.height / scale).toFloat(),
-        )
-    }
+    private fun toBull(c: Cand, scale: Double) = OverlayView.Bull(
+        cx = (c.cx / scale).toFloat(),
+        cy = (c.cy / scale).toFloat(),
+        r = (c.r / scale).toFloat(),
+    )
 
-    /**
-     * Find the target card: the largest bright rectangular region in the frame.
-     * Uses Otsu threshold + morphological close (to fill in the dark bulls so
-     * they don't fragment the card into multiple contours) + largest contour.
-     * Returns null if nothing above min-area threshold looks card-like.
-     */
-    private fun findCardBounds(gray: Mat, w: Int, h: Int): CvRect? {
-        val thresh = Mat()
-        val closed = Mat()
-        val contours = ArrayList<MatOfPoint>()
-        val hierarchy = Mat()
-        try {
-            Imgproc.threshold(gray, thresh, 0.0, 255.0, Imgproc.THRESH_BINARY + Imgproc.THRESH_OTSU)
-            // Close radius must be > half the largest bull diameter so bull holes fill.
-            val kernelSize = (kmin(w, h) * 0.08).toInt().coerceAtLeast(9)
-            val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, CvSize(kernelSize.toDouble(), kernelSize.toDouble()))
-            Imgproc.morphologyEx(thresh, closed, Imgproc.MORPH_CLOSE, kernel)
-            kernel.release()
-
-            Imgproc.findContours(closed, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
-            val frameArea = (w * h).toDouble()
-            val minArea = frameArea * 0.03   // card must be ≥3% of frame
-            val maxArea = frameArea * 0.75   // reject if it's basically the whole frame (over-bright scene)
-            var bestArea = 0.0
-            var bestRect: CvRect? = null
-            for (c in contours) {
-                val area = Imgproc.contourArea(c)
-                if (area < minArea || area > maxArea) continue
-                if (area > bestArea) {
-                    val rect = Imgproc.boundingRect(c)
-                    // Sanity: aspect ratio between 1:3 and 3:1 (cards are roughly rectangular, not slivers)
-                    val ar = rect.width.toDouble() / rect.height
-                    if (ar in 0.3..3.5) {
-                        bestArea = area
-                        bestRect = rect
-                    }
-                }
+    /** Drop lower-scoring circles whose centre falls within max(r) of a kept one. */
+    private fun nonMaxSuppress(sorted: List<Cand>): List<Cand> {
+        val kept = ArrayList<Cand>(sorted.size)
+        for (c in sorted) {
+            var conflict = false
+            for (k in kept) {
+                val dx = c.cx - k.cx
+                val dy = c.cy - k.cy
+                val thresh = kotlin.math.max(c.r, k.r) * NMS_OVERLAP_R_MUL
+                if (dx * dx + dy * dy < thresh * thresh) { conflict = true; break }
             }
-            return bestRect
-        } finally {
-            thresh.release()
-            closed.release()
-            hierarchy.release()
-            contours.forEach { it.release() }
+            if (!conflict) kept.add(c)
+            if (kept.size >= MAX_BULLS_KEPT) break
         }
+        return kept
     }
+
+    /** Union-find clustering: two bulls linked if distance ≤ eps × mean radius. */
+    private fun clusterByProximity(bulls: List<Cand>, eps: Float): List<List<Cand>> {
+        val n = bulls.size
+        val parent = IntArray(n) { it }
+        fun find(a: Int): Int {
+            var x = a
+            while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x] }
+            return x
+        }
+        for (i in 0 until n) for (j in i + 1 until n) {
+            val a = bulls[i]; val b = bulls[j]
+            val e = ((a.r + b.r) / 2f) * eps
+            val dx = a.cx - b.cx; val dy = a.cy - b.cy
+            if (dx * dx + dy * dy <= e * e) {
+                val ra = find(i); val rb = find(j)
+                if (ra != rb) parent[ra] = rb
+            }
+        }
+        val groups = HashMap<Int, ArrayList<Cand>>()
+        for (i in 0 until n) groups.getOrPut(find(i)) { ArrayList() }.add(bulls[i])
+        return groups.values.sortedByDescending { it.size }
+    }
+
 
     /**
      * Score how "bull-like" a candidate circle is: mean brightness of a small
