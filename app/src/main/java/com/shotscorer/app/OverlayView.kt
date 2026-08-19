@@ -17,10 +17,16 @@ class OverlayView @JvmOverloads constructor(
     data class Bull(val cx: Float, val cy: Float, val r: Float)
     data class CardRect(val x: Float, val y: Float, val w: Float, val h: Float)
 
+    /** One sample of the aim trace: (dx,dy) is the vector from the active
+     *  bull to where the rifle was pointing (i.e. frame centre) when this
+     *  sample was captured, expressed in FULL-resolution image pixels. */
+    data class AimSample(val dx: Float, val dy: Float)
+
     private data class State(
         val bulls: List<Bull>,
         val activeIndex: Int,
         val card: CardRect?,
+        val trace: List<AimSample>,
         val frameW: Int,
         val frameH: Int,
         val timestampMs: Long,
@@ -53,9 +59,27 @@ class OverlayView @JvmOverloads constructor(
         strokeWidth = 3f
         isAntiAlias = true
     }
+    private val traceLinePaint = Paint().apply {
+        color = Color.argb(200, 80, 220, 120)
+        style = Paint.Style.STROKE
+        strokeWidth = 2f
+        isAntiAlias = true
+    }
+    private val traceHeadPaint = Paint().apply {
+        color = Color.WHITE
+        style = Paint.Style.FILL
+        isAntiAlias = true
+    }
 
-    fun updateFrame(bulls: List<Bull>, activeIndex: Int, card: CardRect?, frameW: Int, frameH: Int) {
-        state = State(bulls, activeIndex, card, frameW, frameH, System.currentTimeMillis())
+    fun updateFrame(
+        bulls: List<Bull>,
+        activeIndex: Int,
+        card: CardRect?,
+        trace: List<AimSample>,
+        frameW: Int,
+        frameH: Int,
+    ) {
+        state = State(bulls, activeIndex, card, trace, frameW, frameH, System.currentTimeMillis())
         postInvalidate()
     }
 
@@ -100,6 +124,9 @@ class OverlayView @JvmOverloads constructor(
             )
         }
 
+        var activeCx = 0f
+        var activeCy = 0f
+        var activeCr = 0f
         for ((i, b) in s.bulls.withIndex()) {
             val cx = offX + b.cx * sx
             val cy = offY + b.cy * sy
@@ -109,9 +136,31 @@ class OverlayView @JvmOverloads constructor(
                 val armLen = cr.coerceAtLeast(30f) * 1.5f
                 canvas.drawLine(cx - armLen, cy, cx + armLen, cy, activeCrossPaint)
                 canvas.drawLine(cx, cy - armLen, cx, cy + armLen, activeCrossPaint)
+                activeCx = cx; activeCy = cy; activeCr = cr
             } else {
                 canvas.drawCircle(cx, cy, cr, inactivePaint)
             }
+        }
+
+        // Draw the aim trace as a polyline anchored to the current active bull.
+        // Each sample's (dx,dy) is in FULL-res frame pixels — scale to view.
+        if (s.activeIndex in s.bulls.indices && s.trace.isNotEmpty()) {
+            val trace = s.trace
+            var prevX = activeCx + trace[0].dx * sx
+            var prevY = activeCy + trace[0].dy * sy
+            val n = trace.size
+            for (i in 1 until n) {
+                val fx = activeCx + trace[i].dx * sx
+                val fy = activeCy + trace[i].dy * sy
+                // Older = fainter. Fade from 40 alpha at oldest to 220 at newest.
+                val age = (n - i).toFloat() / n
+                val alpha = (220 - age * 180).toInt().coerceIn(20, 220)
+                traceLinePaint.alpha = alpha
+                canvas.drawLine(prevX, prevY, fx, fy, traceLinePaint)
+                prevX = fx; prevY = fy
+            }
+            // "Where the rifle is pointing right now" — a small white dot at the head.
+            canvas.drawCircle(prevX, prevY, 5f, traceHeadPaint)
         }
     }
 }

@@ -54,6 +54,12 @@ class MainActivity : AppCompatActivity() {
         private const val MAX_BULLS_KEPT = 200
         private const val CLUSTER_MIN_BULLS = 3
         private const val CLUSTER_EPS_R_MUL = 4.0f
+
+        // Aim trace: 90 samples ≈ last 3-6 s at 15-30 fps detection rate.
+        private const val TRACE_MAX_SAMPLES = 90
+        // If active bull jumps more than this many bull-radii between frames,
+        // treat as a new aim (different bull entirely) and reset the trace.
+        private const val TRACE_RESET_JUMP_MUL = 3.0f
     }
 
     private lateinit var binding: ActivityMainBinding
@@ -70,6 +76,12 @@ class MainActivity : AppCompatActivity() {
     private val detecting = AtomicBoolean(false)
     private var frameCallbackRegistered = false
     private var detectionByteBuffer = ByteArray(0)
+
+    /** Ring buffer of recent aim-vector samples, in full-res frame pixels.
+     *  Oldest first, newest last. Cleared when active bull identity changes. */
+    private val aimTrace: ArrayDeque<OverlayView.AimSample> = ArrayDeque()
+    private var lastBullCx = 0f
+    private var lastBullCy = 0f
     private val timerHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private val timerRunnable = object : Runnable {
         override fun run() {
@@ -366,6 +378,7 @@ class MainActivity : AppCompatActivity() {
             if (isRecording) stopRecordingSafely()
             cameraHelper?.removeSurface(binding.preview.holder.surface)
             frameCallbackRegistered = false
+            aimTrace.clear()
             runOnUiThread {
                 binding.recordButton.isEnabled = false
                 binding.focusRow.visibility = android.view.View.GONE
@@ -432,6 +445,7 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     if (result.bulls.isEmpty() && result.card == null) {
                         binding.overlay.clearBull()
+                        aimTrace.clear()
                     } else {
                         val cxFrame = w / 2f
                         val cyFrame = h / 2f
@@ -441,7 +455,27 @@ class MainActivity : AppCompatActivity() {
                             val dy = b.cy - cyFrame
                             dx * dx + dy * dy
                         } ?: -1
-                        binding.overlay.updateFrame(result.bulls, activeIdx, result.card, w, h)
+
+                        if (activeIdx in result.bulls.indices) {
+                            val ab = result.bulls[activeIdx]
+                            // Reset trace on aim switch to a different bull.
+                            val jumped = aimTrace.isNotEmpty() && run {
+                                val dx = ab.cx - lastBullCx
+                                val dy = ab.cy - lastBullCy
+                                (dx * dx + dy * dy) > (ab.r * TRACE_RESET_JUMP_MUL).let { it * it }
+                            }
+                            if (jumped) aimTrace.clear()
+                            lastBullCx = ab.cx
+                            lastBullCy = ab.cy
+                            // Aim sample = vector from active bull to frame centre.
+                            val sample = OverlayView.AimSample(cxFrame - ab.cx, cyFrame - ab.cy)
+                            aimTrace.addLast(sample)
+                            while (aimTrace.size > TRACE_MAX_SAMPLES) aimTrace.removeFirst()
+                        }
+
+                        binding.overlay.updateFrame(
+                            result.bulls, activeIdx, result.card, aimTrace.toList(), w, h,
+                        )
                     }
                 }
             } catch (t: Throwable) {
